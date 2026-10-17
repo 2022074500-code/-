@@ -90,10 +90,12 @@ import {
 import { CustomAppGlyph, IconGlyph } from "@/components/icon-glyph";
 import { DesktopCustomizer } from "@/components/desktop-customizer";
 import {
+  collectFirstPaintThemeAssetIds,
   collectThemeAssetIds,
   getThemeAssetMap,
   readThemeProfile,
-  writeThemeProfile
+  writeThemeProfile,
+  THEME_ASSETS_CHANGED_EVENT
 } from "@/lib/theme-storage";
 import { THEME_PACKAGE_INSTALLED_EVENT } from "@/lib/theme-package";
 import {
@@ -155,6 +157,25 @@ const DOCK_PAGE_KEY = "dock" as const;
 type DragPageKey = DesktopPageKey | typeof DOCK_PAGE_KEY;
 const SWIPE_THRESHOLD_RATIO = 0.2;
 const SWIPE_MIN_THRESHOLD = 60;
+
+type DesktopIdleWindow = Window & {
+  requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number;
+  cancelIdleCallback?: (handle: number) => void;
+};
+
+/** 推到首帧之后的空闲期执行（带 timeout 兜底）；不支持 requestIdleCallback 时用 setTimeout。返回取消函数。 */
+function scheduleDesktopIdleTask(callback: () => void, timeout = 2000): () => void {
+  if (typeof window === "undefined") {
+    return () => { };
+  }
+  const idleWindow = window as DesktopIdleWindow;
+  if (typeof idleWindow.requestIdleCallback === "function") {
+    const handle = idleWindow.requestIdleCallback(() => callback(), { timeout });
+    return () => idleWindow.cancelIdleCallback?.(handle);
+  }
+  const handle = window.setTimeout(callback, 600);
+  return () => window.clearTimeout(handle);
+}
 
 function parseColorAlpha(value: string): { hex: string; alpha: number } {
   const rgbaMatch = value.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+))?\s*\)/);
@@ -1342,6 +1363,18 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
 
   const activeIconSkins = useMemo(() => resolveActiveIconSkins(draftTheme), [draftTheme]);
   const themeAssetKey = useMemo(() => collectThemeAssetIds(draftTheme).sort().join("|"), [draftTheme]);
+  const firstPaintThemeAssetKey = useMemo(() => collectFirstPaintThemeAssetIds(draftTheme).join("|"), [draftTheme]);
+  // 资产补读账本：已取回的 id（含开机预加载带进来的），只在读取成功回调里记账。
+  const draftThemeRef = useRef(draftTheme);
+  draftThemeRef.current = draftTheme;
+  const loadedThemeAssetIdsRef = useRef<Set<string> | null>(null);
+  if (loadedThemeAssetIdsRef.current === null) {
+    loadedThemeAssetIdsRef.current = new Set(Object.keys(initialThemeAssets ?? {}));
+  }
+  const inflightThemeAssetIdsRef = useRef<Set<string>>(new Set());
+  const themeAssetBootPassPendingRef = useRef(true);
+  // 资产被覆盖写/删除时 +1：从账本里划掉这些 id，补读 effect 重跑后重新取。
+  const [themeAssetRevision, setThemeAssetRevision] = useState(0);
   const wallpaperDataUrl = draftTheme.wallpaperAssetId ? themeAssets[draftTheme.wallpaperAssetId] ?? null : null;
   const fontDataUrl = draftTheme.fontAssetId ? themeAssets[draftTheme.fontAssetId] ?? null : null;
   const dockSkinUrl = draftTheme.dockSkinAssetId ? themeAssets[draftTheme.dockSkinAssetId] ?? null : null;
@@ -1977,24 +2010,78 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     };
   }, [desktopReady]);
 
+  // 主题资产增量补读：只读账本里没有、也不在途的 id，单事务批量读。
+  // - 首屏必需（当前壁纸/字体/dock/激活图标皮肤）缺了就立即读——用户换肤要马上生效；
+  // - 其余（壁纸库、未激活图标方案）开机首轮推到首帧空闲期，之后的变化立即读。
+  // StrictMode 挂载-卸载-再挂载：首轮空闲任务若未开始就被 cleanup，回滚首轮标记，
+  // 让再挂载的那一轮继续按首轮走，避免这批资产永远读不到或被重复读。
   useEffect(() => {
-    const ids = collectThemeAssetIds(draftTheme);
-    if (ids.length === 0) {
+    const loaded = loadedThemeAssetIdsRef.current;
+    if (!loaded) return;
+    const inflight = inflightThemeAssetIdsRef.current;
+    const profile = draftThemeRef.current;
+    const isPending = (id: string) => Boolean(id) && !loaded.has(id) && !inflight.has(id);
+
+    const fetchIds = (ids: string[]) => {
+      const targets = Array.from(new Set(ids)).filter(isPending);
+      if (!targets.length) return;
+      targets.forEach((id) => inflight.add(id));
+      void getThemeAssetMap(targets)
+        .then((map) => {
+          const fetchedIds = Object.keys(map);
+          fetchedIds.forEach((id) => loaded.add(id));
+          if (fetchedIds.length) {
+            setThemeAssets((previous) => ({ ...previous, ...map }));
+          }
+        })
+        .catch((error) => {
+          console.warn("[Desktop] theme asset load failed:", error);
+        })
+        .finally(() => {
+          targets.forEach((id) => inflight.delete(id));
+        });
+    };
+
+    const urgentIds = collectFirstPaintThemeAssetIds(profile).filter(isPending);
+    const urgentSet = new Set(urgentIds);
+    const restIds = collectThemeAssetIds(profile).filter((id) => isPending(id) && !urgentSet.has(id));
+
+    fetchIds(urgentIds);
+    if (!restIds.length) return;
+
+    const isBootPass = themeAssetBootPassPendingRef.current;
+    themeAssetBootPassPendingRef.current = false;
+    if (!isBootPass) {
+      fetchIds(restIds);
       return;
     }
 
-    let disposed = false;
-    void getThemeAssetMap(ids).then((map) => {
-      if (disposed) {
-        return;
-      }
-      setThemeAssets((previous) => ({ ...previous, ...map }));
+    let started = false;
+    const cancelIdle = scheduleDesktopIdleTask(() => {
+      started = true;
+      fetchIds(restIds);
     });
-
     return () => {
-      disposed = true;
+      if (started) return;
+      cancelIdle();
+      themeAssetBootPassPendingRef.current = true;
     };
-  }, [draftTheme, themeAssetKey]);
+  }, [themeAssetKey, firstPaintThemeAssetKey, themeAssetRevision]);
+
+  useEffect(() => {
+    const onAssetsChanged = (event: Event) => {
+      const ids = (event as CustomEvent<{ ids?: unknown }>).detail?.ids;
+      if (!Array.isArray(ids)) return;
+      const loaded = loadedThemeAssetIdsRef.current;
+      let invalidated = false;
+      for (const id of ids) {
+        if (typeof id === "string" && loaded?.delete(id)) invalidated = true;
+      }
+      if (invalidated) setThemeAssetRevision((n) => n + 1);
+    };
+    window.addEventListener(THEME_ASSETS_CHANGED_EVENT, onAssetsChanged);
+    return () => window.removeEventListener(THEME_ASSETS_CHANGED_EVENT, onAssetsChanged);
+  }, []);
 
 
   useEffect(() => {
@@ -2012,7 +2099,11 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
       return;
     }
 
-    node.textContent = `@font-face{font-family:"AIVirtualPhoneUserFont";src:url("${fontDataUrl}");font-display:swap;}`;
+    // MainApp 开机预热时已写入同一份规则：内容相同就不重写，避免样式表重解析、字体被重新加载而闪一下。
+    const nextFontFaceCss = `@font-face{font-family:"AIVirtualPhoneUserFont";src:url("${fontDataUrl}");font-display:swap;}`;
+    if (node.textContent !== nextFontFaceCss) {
+      node.textContent = nextFontFaceCss;
+    }
   }, [fontDataUrl]);
 
   // Inject theme color overrides as <style> tag (BEFORE globalCustomCSS so it can be overridden)
