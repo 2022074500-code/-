@@ -1,4 +1,4 @@
-import { DEFAULT_THEME_PROFILE, normalizeThemeProfile, type ThemeAssetType, type ThemeProfile } from "@/lib/theme-types";
+import { DEFAULT_THEME_PROFILE, normalizeThemeProfile, resolveActiveIconSkins, type ThemeAssetType, type ThemeProfile } from "@/lib/theme-types";
 import { kvGet, kvSet, kvRemove, registerKvMigration } from "./kv-db";
 import { openIndexedDbAtLeast } from "./idb-open";
 
@@ -206,6 +206,17 @@ function createThemeAssetId(type: ThemeAssetType): string {
   return `${type}_${uuid}`;
 }
 
+/**
+ * 主题资产写入/删除后广播的事件（detail.ids）。桌面壳的补读账本据此失效对应 id，
+ * 同 id 覆盖写（如 providedId 重新上传、主题包重装）后能重新读到新内容。
+ */
+export const THEME_ASSETS_CHANGED_EVENT = "ai-phone-theme-assets-changed";
+
+function notifyThemeAssetsChanged(ids: string[]): void {
+  if (typeof window === "undefined" || !ids.length) return;
+  window.dispatchEvent(new CustomEvent(THEME_ASSETS_CHANGED_EVENT, { detail: { ids } }));
+}
+
 async function saveAssetRecord(record: ThemeAssetRecord): Promise<void> {
   const database = await openThemeDb();
   if (!database) {
@@ -220,6 +231,7 @@ async function saveAssetRecord(record: ThemeAssetRecord): Promise<void> {
   } finally {
     database.close();
   }
+  notifyThemeAssetsChanged([record.id]);
 }
 
 async function readAssetRecord(id: string): Promise<ThemeAssetRecord | null> {
@@ -230,9 +242,12 @@ async function readAssetRecord(id: string): Promise<ThemeAssetRecord | null> {
 
   try {
     const transaction = database.transaction(THEME_ASSET_STORE, "readonly");
+    // 先挂完成回调再发请求：await 请求期间事务可能已经提交，事后再挂 oncomplete 会永不触发。
+    const done = runTransactionDone(transaction);
+    done.catch(() => undefined);
     const store = transaction.objectStore(THEME_ASSET_STORE);
     const result = await runRequest(store.get(id));
-    await runTransactionDone(transaction);
+    await done;
     return (result as ThemeAssetRecord | undefined) ?? null;
   } finally {
     database.close();
@@ -244,23 +259,42 @@ export async function getThemeAssetDataUrl(id: string): Promise<string | null> {
   return record?.dataUrl ?? null;
 }
 
+async function readAssetRecordsBatch(ids: string[]): Promise<ThemeAssetRecord[]> {
+  const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
+  if (!uniqueIds.length) {
+    return [];
+  }
+
+  const database = await openThemeDb();
+  if (!database) {
+    return [];
+  }
+
+  try {
+    // 单连接 + 单事务批量读；完成回调必须在发请求之前挂上（理由同 readAssetRecord）。
+    const transaction = database.transaction(THEME_ASSET_STORE, "readonly");
+    const done = runTransactionDone(transaction);
+    done.catch(() => undefined);
+    const store = transaction.objectStore(THEME_ASSET_STORE);
+    const rows = await Promise.all(uniqueIds.map((id) => runRequest(store.get(id))));
+    await done;
+    return rows.filter((row): row is ThemeAssetRecord => Boolean(row));
+  } finally {
+    database.close();
+  }
+}
+
 export async function getThemeAssetMap(ids: string[]): Promise<Record<string, string>> {
   const map: Record<string, string> = {};
-  const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
-  const rows = await Promise.all(uniqueIds.map((id) => readAssetRecord(id)));
+  const rows = await readAssetRecordsBatch(ids);
   rows.forEach((row) => {
-    if (!row) {
-      return;
-    }
     map[row.id] = row.dataUrl;
   });
   return map;
 }
 
 export async function readThemeAssetRecords(ids: string[]): Promise<ThemeAssetRecord[]> {
-  const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
-  const rows = await Promise.all(uniqueIds.map((id) => readAssetRecord(id)));
-  return rows.filter((row): row is ThemeAssetRecord => Boolean(row));
+  return readAssetRecordsBatch(ids);
 }
 
 export async function writeThemeAssetRecords(records: ThemeAssetRecord[]): Promise<void> {
@@ -275,7 +309,28 @@ export async function writeThemeAssetRecords(records: ThemeAssetRecord[]): Promi
     });
   });
 
-  await Promise.all(Array.from(uniqueRecords.values()).map((record) => saveAssetRecord(record)));
+  const list = Array.from(uniqueRecords.values());
+  if (!list.length) {
+    return;
+  }
+
+  // 单连接 + 单事务批量写，避免每条记录各自 open → 事务 → close。
+  const database = await openThemeDb();
+  if (!database) {
+    return;
+  }
+  try {
+    const transaction = database.transaction(THEME_ASSET_STORE, "readwrite");
+    const done = runTransactionDone(transaction);
+    // put 同步抛错（如 DataCloneError）时 done 会被跳过 await，先兜住避免未处理的 rejection。
+    done.catch(() => undefined);
+    const store = transaction.objectStore(THEME_ASSET_STORE);
+    list.forEach((record) => store.put(record));
+    await done;
+  } finally {
+    database.close();
+  }
+  notifyThemeAssetsChanged(list.map((record) => record.id));
 }
 
 export async function deleteThemeAsset(id: string): Promise<void> {
@@ -290,6 +345,7 @@ export async function deleteThemeAsset(id: string): Promise<void> {
   } finally {
     database.close();
   }
+  notifyThemeAssetsChanged([id]);
 }
 
 export async function saveThemeAssetFromBlob(
@@ -341,6 +397,20 @@ export function writeThemeProfile(profile: ThemeProfile): ThemeProfile {
   }
 
   return normalized;
+}
+
+/**
+ * 首屏必需的主题资产：当前壁纸 / 上传字体 / dock 皮肤 / 当前激活图标方案的皮肤。
+ * 开机预加载只取这几类；壁纸库、未激活的图标方案等留给桌面空闲期补读。
+ */
+export function collectFirstPaintThemeAssetIds(profile: ThemeProfile): string[] {
+  const ids = [
+    profile.wallpaperAssetId,
+    profile.fontAssetId,
+    profile.dockSkinAssetId,
+    ...Object.values(resolveActiveIconSkins(profile))
+  ].filter((value): value is string => Boolean(value));
+  return Array.from(new Set(ids));
 }
 
 export function collectThemeAssetIds(profile: ThemeProfile): string[] {

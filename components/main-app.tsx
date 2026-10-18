@@ -12,8 +12,8 @@ import { OfflinePushRevampAnnouncement } from "./offline-push-revamp-announcemen
 import { SplashAnimation } from "./splash-animation";
 import { MusicProvider } from "@/lib/music-context";
 import { hydrateKvDb, isKvHydrated } from "@/lib/kv-db";
-import { getThemeAssetMap, readThemeProfile } from "@/lib/theme-storage";
-import { resolveActiveIconSkins, type ThemeProfile } from "@/lib/theme-types";
+import { collectFirstPaintThemeAssetIds, getThemeAssetMap, readThemeProfile } from "@/lib/theme-storage";
+import type { ThemeProfile } from "@/lib/theme-types";
 import { hasPendingMcpOAuthCallback } from "@/lib/tool-executor";
 import { shouldRequestPwaFullscreen } from "@/lib/pwa-display-mode";
 
@@ -21,132 +21,63 @@ const TEXT = {
   loading: "\u52A0\u8F7D\u4E2D...",
 };
 
-const BUILTIN_FONT_URLS = [
-  "/fonts/huiwen.woff2",
-  "/fonts/huiwen.woff2",
-  "/fonts/special-elite.woff2",
-  "/fonts/splash/instrument-serif-regular-400.woff2",
-  "/fonts/splash/instrument-serif-italic-400.woff2",
-  "/fonts/splash/inter-300.woff2",
-  "/fonts/splash/inter-400.woff2",
-  "/fonts/splash/inter-500.woff2",
-  "/fonts/splash/major-mono-display-400.woff2",
-  "/fonts/splash/jetbrains-mono-300.woff2",
-  "/fonts/splash/jetbrains-mono-400.woff2",
-  "/fonts/interview/noto-serif-sc.woff2",
-  "/fonts/interview/bodoni-moda.woff2",
-  "/fonts/interview/bodoni-moda-italic.woff2",
-  "/fonts/interview/eb-garamond.woff2",
-  "/fonts/interview/eb-garamond-italic.woff2",
-  "/fonts/interview/long-cang.woff2",
-  "/fonts/interview/cinzel.woff2",
-  "/fonts/interview/press-start-2p.woff2",
-  "/fonts/notewall/ximai.woff2",
-  "/fonts/notewall/xiaozhitiao.woff2",
-  "/fonts/notewall/huiwen-upload.woff2",
-  "/fonts/notewall/chen-yuluoyan-thin.woff2",
-  "/fonts/game-hall/fredoka-400.woff2",
-  "/fonts/game-hall/fredoka-500.woff2",
-  "/fonts/game-hall/fredoka-600.woff2",
-  "/fonts/game-hall/fredoka-700.woff2",
-  "/fonts/game-hall/caveat-500.woff2",
-  "/fonts/game-hall/caveat-700.woff2",
-  "/fonts/game-hall/zen-maru-gothic-500.woff2",
-  "/fonts/game-hall/zen-maru-gothic-700.woff2",
-  "/fonts/game-hall/zen-maru-gothic-900.woff2",
-  "/fonts/\u5B57\u4F53/MISANS-REGULAR.woff2",
-  "/fonts/\u5B57\u4F53/MISANS-MEDIUM.woff2",
-  "/fonts/\u5B57\u4F53/MISANS-SEMIBOLD.woff2",
-] as const;
-
-const BUILTIN_FONT_LOAD_SPECS = [
-  '400 1em "Instrument Serif"',
-  'italic 400 1em "Instrument Serif"',
+/**
+ * 开机首屏必需的本地字体（开机动画 SplashAnimation 画布用到的三档）。
+ * 只预热这几条：全量内置字体无差别预热会和桌面首帧抢带宽/解码，反而变成运行中卡顿；
+ * 其余字体（访谈/便签墙/游戏大厅等）按 @font-face 的 font-display:swap 用到再加载。
+ */
+const FIRST_PAINT_FONT_SPECS = [
   '300 1em "Inter"',
+  // 桌面默认字体栈 DEFAULT_FONT_FAMILY 里含 "Inter"：没有 PingFang/Noto Sans SC 的设备首屏正文走它的 400 档。
   '400 1em "Inter"',
-  '500 1em "Inter"',
-  '400 1em "Major Mono Display"',
+  'italic 400 1em "Instrument Serif"',
   '300 1em "JetBrains Mono"',
-  '400 1em "JetBrains Mono"',
-  '400 1em "Huiwen"',
-  '400 1em "Noto Serif SC"',
-  '400 1em "Source Han Serif SC"',
-  '400 1em "Bodoni Moda"',
-  'italic 400 1em "Bodoni Moda"',
-  '400 1em "EB Garamond"',
-  'italic 400 1em "EB Garamond"',
-  '400 1em "Long Cang"',
-  '400 1em "Cinzel"',
-  '400 1em "Press Start 2P"',
-  '400 1em "Special Elite"',
-  '400 1em "NoteWall Ximai"',
-  '400 1em "NoteWall Xiaozhitiao"',
-  '400 1em "NoteWall Huiwen"',
-  '400 1em "Game Hall Fredoka"',
-  '500 1em "Game Hall Fredoka"',
-  '600 1em "Game Hall Fredoka"',
-  '700 1em "Game Hall Fredoka"',
-  '500 1em "Game Hall Caveat"',
-  '700 1em "Game Hall Caveat"',
-  '500 1em "Game Hall Zen Maru Gothic"',
-  '700 1em "Game Hall Zen Maru Gothic"',
-  '900 1em "Game Hall Zen Maru Gothic"',
-  '400 1em "MiSans"',
-  '500 1em "MiSans"',
-  '600 1em "MiSans"',
 ] as const;
 
-const FONT_CACHE_BATCH_SIZE = 3;
-const FONT_CACHE_BATCH_DELAY_MS = 80;
+/** 字体预热上限：到点放行，不让慢网络/坏字体把开机拖住。 */
+const FONT_WARMUP_TIMEOUT_MS = 1500;
 
-type IdleDeadlineLike = {
-  didTimeout: boolean;
-  timeRemaining: () => number;
-};
+/** 必须与 desktop-shell 注入的 @font-face 家族名、style 节点 id 保持一致，否则预热不生效。 */
+const THEME_USER_FONT_FAMILY = "AIVirtualPhoneUserFont";
+const THEME_FONT_STYLE_ID = "ai-phone-theme-font-face";
 
-type WindowWithIdleCallback = Window & {
-  requestIdleCallback?: (callback: (deadline: IdleDeadlineLike) => void, options?: { timeout?: number }) => number;
-  cancelIdleCallback?: (handle: number) => void;
-};
-
-function scheduleIdleTask(callback: () => void): () => void {
-  if (typeof window === "undefined") {
-    return () => { };
-  }
-
-  const idleWindow = window as WindowWithIdleCallback;
-  if (typeof idleWindow.requestIdleCallback === "function") {
-    const handle = idleWindow.requestIdleCallback(() => callback(), { timeout: 2400 });
-    return () => idleWindow.cancelIdleCallback?.(handle);
-  }
-
-  const handle = window.setTimeout(callback, 600);
-  return () => window.clearTimeout(handle);
+function withTimeout(task: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(resolve, ms);
+    task.catch(() => undefined).finally(() => {
+      window.clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
+/**
+ * 预热首屏字体（本地 woff2）：只加载 FIRST_PAINT_FONT_SPECS，整体 1.5 秒封顶到点放行。
+ * 与 KV 水合互不依赖，可以并行跑。
+ */
+function warmFirstPaintFonts(): Promise<void> {
+  if (typeof document === "undefined" || !document.fonts) return Promise.resolve();
+  const task = Promise.all(
+    FIRST_PAINT_FONT_SPECS.map((spec) => document.fonts.load(spec).catch(() => []))
+  );
+  return withTimeout(task, FONT_WARMUP_TIMEOUT_MS);
 }
 
-async function cacheFontUrl(url: string): Promise<void> {
-  const response = await fetch(url, { cache: "force-cache" });
-  if (!response.ok) return;
-  await response.arrayBuffer();
-}
-
-async function warmBuiltinFonts(shouldStop: () => boolean): Promise<void> {
-  if (typeof window === "undefined") return;
-
-  for (let index = 0; index < BUILTIN_FONT_URLS.length; index += FONT_CACHE_BATCH_SIZE) {
-    if (shouldStop()) return;
-    const batch = BUILTIN_FONT_URLS.slice(index, index + FONT_CACHE_BATCH_SIZE);
-    await Promise.all(batch.map((url) => cacheFontUrl(url).catch(() => undefined)));
-    if (shouldStop()) return;
-    await wait(FONT_CACHE_BATCH_DELAY_MS);
+/**
+ * 预热主题自带（用户上传）字体：提前注入与 desktop-shell 完全同名的 @font-face
+ * （家族名 AIVirtualPhoneUserFont、同一个 style 节点），并等它解码完成（同样封顶）。
+ * desktop-shell 挂载后会写入同样的内容，不会产生第二份字体。
+ */
+function warmThemeUserFont(fontDataUrl: string | undefined): Promise<void> {
+  if (!fontDataUrl || typeof document === "undefined" || !document.fonts) return Promise.resolve();
+  let node = document.getElementById(THEME_FONT_STYLE_ID) as HTMLStyleElement | null;
+  if (!node) {
+    node = document.createElement("style");
+    node.id = THEME_FONT_STYLE_ID;
+    document.head.append(node);
   }
-
-  if (shouldStop() || !document.fonts) return;
-  await Promise.all(BUILTIN_FONT_LOAD_SPECS.map((spec) => document.fonts.load(spec).catch(() => [])));
+  node.textContent = `@font-face{font-family:"${THEME_USER_FONT_FAMILY}";src:url("${fontDataUrl}");font-display:swap;}`;
+  return withTimeout(document.fonts.load(`400 1em "${THEME_USER_FONT_FAMILY}"`), FONT_WARMUP_TIMEOUT_MS);
 }
 
 function SplashScreen({ ready = false, onEnter }: { ready?: boolean; onEnter?: () => void }) {
@@ -182,16 +113,6 @@ type PreparedDesktopTheme = {
   assets: Record<string, string>;
 };
 
-function collectFirstPaintThemeAssetIds(profile: ThemeProfile): string[] {
-  const ids = [
-    profile.wallpaperAssetId,
-    profile.fontAssetId,
-    profile.dockSkinAssetId,
-    ...Object.values(resolveActiveIconSkins(profile))
-  ].filter((value): value is string => Boolean(value));
-  return Array.from(new Set(ids));
-}
-
 function preloadImageDataUrl(url: string): Promise<void> {
   if (typeof window === "undefined" || !url.startsWith("data:image/")) {
     return Promise.resolve();
@@ -222,7 +143,11 @@ async function prepareDesktopThemeForFirstPaint(): Promise<PreparedDesktopTheme>
   const profile = readThemeProfile();
   const assetIds = collectFirstPaintThemeAssetIds(profile);
   const assets = assetIds.length ? await getThemeAssetMap(assetIds) : {};
-  await Promise.all(Object.values(assets).map(preloadImageDataUrl));
+  const fontDataUrl = profile.fontAssetId ? assets[profile.fontAssetId] : undefined;
+  await Promise.all([
+    ...Object.values(assets).map(preloadImageDataUrl),
+    warmThemeUserFont(fontDataUrl),
+  ]);
   return { profile, assets };
 }
 
@@ -240,7 +165,11 @@ export function MainApp() {
     // （摊主钥匙、聊天记录等都存在里面）。静默尽力而为，被拒也无碍。
     void navigator.storage?.persist?.().catch(() => {});
 
+    // 首屏字体预热与 KV 水合互不依赖，并行起跑（自带 1.5s 上限）。
+    const fontWarmupTask = warmFirstPaintFonts();
+
     void (async () => {
+      // 主题准备读的是 KV 内存缓存，必须等水合完成后再做，不能与水合并行。
       await hydrateKvDb();
       if (cancelled) return;
       // 水合失败绝不放行：此时所有 KV 数据（设置/绑定/线下记录等）在内存里都是
@@ -257,6 +186,9 @@ export function MainApp() {
       } catch (error) {
         console.warn("[MainApp] desktop theme preload failed:", error);
       }
+
+      // 放行前等首屏字体就位（或到 1.5s 上限），避免进桌面后字体到位引起整页重排。
+      await fontWarmupTask;
 
       if (cancelled) return;
       setPreparedDesktopTheme(nextPreparedTheme);
